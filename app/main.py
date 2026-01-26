@@ -21,6 +21,9 @@ from apscheduler.job import Job
 import os
 from dotenv import load_dotenv
 
+from dramatiq.brokers.redis import RedisBroker
+import dramatiq
+
 load_dotenv()
 
 logging.basicConfig(
@@ -29,6 +32,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+REDIS_HOST = os.getenv("REDIS_HOST")
+REDIS_PORT = os.getenv("REDIS_PORT")
 
 
 class Base(DeclarativeBase):
@@ -93,6 +98,8 @@ class RefreshLogDB(Base):
 
 engine = create_async_engine(
     DATABASE_URL,
+    future=True,
+    # echo=True,
     pool_size=10,
     max_overflow=20,
 )
@@ -102,6 +109,9 @@ AsyncSessionLocal = async_sessionmaker(
 )
 
 scheduler = AsyncIOScheduler()
+
+redis_broker = RedisBroker(host=REDIS_HOST, port=REDIS_PORT)
+dramatiq.set_broker(redis_broker)
 
 
 @asynccontextmanager
@@ -135,7 +145,7 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     logger.info("Scheduler started")
     scheduler.add_job(
-        scheduled_refresh,
+        scheduled_fetch_job,
         trigger=IntervalTrigger(minutes=15),
         id="periodic_refresh",
         name="Periodic content refresh (every 15 min)",
@@ -299,15 +309,15 @@ async def fetchSource(source: SourceType, config: Dict) -> Dict[str, Any]:
         result["fetch_time"] = (datetime.now(timezone.utc) - start_time).total_seconds()
     except httpx.TimeoutException as e:
         result["error"] = f"Timeout after {config.get('timeout')}s"
-        logger.error(f"✗ {source.value}: Timeout - {e}")
+        logger.error(f"{source.value}: Timeout - {e}")
 
     except httpx.HTTPStatusError as e:
         result["error"] = f"HTTP {e.response.status_code}"
-        logger.error(f"✗ {source.value}: HTTP error - {e}")
+        logger.error(f"{source.value}: HTTP error - {e}")
 
     except Exception as e:
         result["error"] = str(e)
-        logger.error(f"✗ {source.value}: Unexpected error - {e}")
+        logger.error(f"{source.value}: Unexpected error - {e}")
 
     return result
 
@@ -359,7 +369,7 @@ async def fetchAllSource(db: AsyncSession):
     print(f"Fetched {len(all_articles)} articles, saved {saved_count} new articles")
 
 
-async def scheduled_refresh():
+async def scheduled_fetch():
     """
     Background refresh function called by APScheduler
     Runs independently of user requests every 15 minutes
@@ -374,11 +384,15 @@ async def scheduled_refresh():
                 status="running",
                 sources_attempted=len(SOURCES),
             )
+            print("Adding entry to refresh log")
             db.add(refresh_log)
             await db.commit()
+            print("Added entry to refresh log")
             tasks = [fetchSource(source, config) for source, config in SOURCES.items()]
 
             results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            print("Fetched entry from all the sources")
             total_articles = 0
             new_articles = 0
             sources_succeeded = 0
@@ -405,7 +419,7 @@ async def scheduled_refresh():
                     await db.commit()
                 else:
                     sources_failed += 1
-
+            print("Added articles to the DB")
             refresh_log.completed_at = datetime.now(timezone.utc)
             refresh_log.total_articles_fetched = total_articles
             refresh_log.new_articles = new_articles
@@ -413,6 +427,7 @@ async def scheduled_refresh():
             refresh_log.sources_failed = sources_failed
             refresh_log.status = "completed"
 
+            print("Updating MetaData")
             metadata_stmt = select(MetadataDB).where(MetadataDB.key == "last_refresh")
             metadata_result = await db.execute(metadata_stmt)
             metadata = metadata_result.scalar_one_or_none()
@@ -438,7 +453,19 @@ async def scheduled_refresh():
             refresh_log.status = "failed"
             refresh_log.error_message = str(e)
             refresh_log.completed_at = datetime.now(timezone.utc)
+            await db.rollback()
+        finally:
             await db.commit()
+
+
+@dramatiq.actor
+def scheduled_fetch_actor():
+    asyncio.run(scheduled_fetch())
+
+
+def scheduled_fetch_job():
+    print("Send request to worker")
+    scheduled_fetch_actor.send()
 
 
 @app.get("/")
@@ -491,7 +518,7 @@ async def get_articles(
 async def trigger_manual_refresh():
     """Manually trigger a refresh (still runs in background)"""
     scheduler.add_job(
-        scheduled_refresh,
+        scheduled_fetch_job,
         trigger="date",  # Run once immediately
         id=f"manual_refresh_{datetime.now(timezone.utc).timestamp()}",
         replace_existing=False,
