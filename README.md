@@ -129,7 +129,7 @@ Returns API status and version information.
 
 #### Get Articles
 ```http
-GET /api/articles?source={source}&limit={limit}&offset={offset}
+GET /api/articles?source={source}
 ```
 
 **Query Parameters:**
