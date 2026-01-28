@@ -8,7 +8,7 @@ and health checks.
 from datetime import datetime, timezone
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, func, table
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
@@ -46,6 +46,9 @@ async def health_check():
 @router.get("/api/articles", tags=["Articles"])
 async def get_articles(
     source: Optional[SourceType] = None,
+    limit: int = 10,
+    page_number: int = 0,
+    search_title: str = "",
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -56,6 +59,9 @@ async def get_articles(
 
     Args:
         source: Filter by specific source (optional)
+        limit: Limits the number of entries to be fetched (optional)
+        page_number: Calculate the offset needed
+        search_title: Search for matching title (optional)
         db: Database session (injected)
 
     Returns:
@@ -69,12 +75,20 @@ async def get_articles(
     try:
         # Build query
         stmt = select(ArticleDB)
+        articles_table = table("articles")
 
         if source:
             stmt = stmt.where(ArticleDB.source == source.value)
             logger.debug(f"Filtering by source: {source.value}")
 
-        stmt = stmt.order_by(ArticleDB.publish_date.desc())
+        if search_title:
+            print("Search needed for title: ", search_title)
+            stmt = stmt.filter(ArticleDB.title.icontains(search_title))
+
+        print("Page Number: ", page_number)
+        offset = (page_number - 1) * limit
+
+        stmt = stmt.order_by(ArticleDB.publish_date.desc()).limit(limit).offset(offset)
 
         # Execute query
         result = await db.execute(stmt)
@@ -83,8 +97,26 @@ async def get_articles(
         logger.info(f"Retrieved {len(articles)} articles from database")
 
         # Get unique sources
-        unique_sources = list({article.source for article in articles})
+        stmt = select(ArticleDB.source).distinct()
+        result = await db.execute(stmt)
+        unique_sources = result.scalars().all()
         logger.debug(f"Unique sources in results: {unique_sources}")
+
+        stmt = select(func.count())
+        if source:
+            print(source)
+            stmt = stmt.where(ArticleDB.source == source)
+
+        if search_title:
+            print("Search needed for title: ", search_title)
+            stmt = stmt.filter(ArticleDB.title.icontains(search_title))
+
+        if not search_title and not source:
+            stmt = stmt.select_from(articles_table)
+
+        result = await db.execute(stmt)
+        total_entries = result.scalar_one_or_none()
+        print("total entries:", total_entries)
 
         # Get last update time
         metadata_stmt = select(MetadataDB.update_at).where(
@@ -98,7 +130,7 @@ async def get_articles(
         return {
             "articles": articles,
             "unique_sources": unique_sources,
-            "last_update": last_update,
+            "total_entries": total_entries,
         }
 
     except Exception as e:
