@@ -33,8 +33,11 @@ class Settings(BaseSettings):
     DATABASE_URL: str
 
     # Redis
-    REDIS_HOST: str = "localhost"
-    REDIS_PORT: int = 6379
+    REDIS_BROKER_HOST: str = "localhost"
+    REDIS_BROKER_PORT: int = 6379
+
+    REDIS_CACHE_HOST: str
+    REDIS_CACHE_PORT: int
 
     # Application
     APP_NAME: str = "Content Aggregator API"

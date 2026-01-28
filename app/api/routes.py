@@ -5,6 +5,7 @@ Defines all FastAPI endpoints for article retrieval, refresh management,
 and health checks.
 """
 
+import json
 from datetime import datetime, timezone
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
@@ -12,11 +13,13 @@ from sqlalchemy import select, func, table
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
+from app.db.cache import redis_cache_get, redis_cache_set_expiry
 from app.models.database import ArticleDB, MetadataDB
 from app.models.schemas import SourceType
 from app.services.scheduler import scheduler, trigger_scheduled_refresh
 from app.core.config import settings
 from app.core.logging import get_logger
+
 
 logger = get_logger(__name__)
 
@@ -77,55 +80,88 @@ async def get_articles(
         stmt = select(ArticleDB)
         articles_table = table("articles")
 
-        if source:
-            stmt = stmt.where(ArticleDB.source == source.value)
-            logger.debug(f"Filtering by source: {source.value}")
+        cached_unique_src = None
+        cached_articles = None
+        cached_total = None
 
-        if search_title:
-            print("Search needed for title: ", search_title)
-            stmt = stmt.filter(ArticleDB.title.icontains(search_title))
+        # Check if the articles already exist in redis or not.
+        # search results will not be cached.
+        if not search_title:
+            key = f"articles_{source.value if source else "all"}_{page_number}"
+            cached_articles = redis_cache_get(key)
 
-        print("Page Number: ", page_number)
-        offset = (page_number - 1) * limit
+            key = f"total_{source.value if source else "all"}_{page_number}"
+            cached_total = redis_cache_get(key)
 
-        stmt = stmt.order_by(ArticleDB.publish_date.desc()).limit(limit).offset(offset)
+            key = f"unique_sources"
+            cached_unique_src = redis_cache_get(key)
 
-        # Execute query
-        result = await db.execute(stmt)
-        articles = result.scalars().all()
+        if cached_articles:
+            articles = cached_articles
+        else:
+            if source:
+                stmt = stmt.where(ArticleDB.source == source.value)
+                logger.debug(f"Filtering by source: {source.value}")
 
-        logger.info(f"Retrieved {len(articles)} articles from database")
+            if search_title:
+                logger.debug(f"Searching for title: {search_title}")
+                stmt = stmt.filter(ArticleDB.title.icontains(search_title))
+
+            print("Page Number: ", page_number)
+            offset = (page_number - 1) * limit
+
+            stmt = (
+                stmt.order_by(ArticleDB.publish_date.desc()).limit(limit).offset(offset)
+            )
+
+            # Execute query
+            result = await db.execute(stmt)
+            articles = result.scalars().all()
+
+            logger.info(f"Retrieved {len(articles)} articles from database")
+
+            if not search_title and page_number < 5:
+                redis_cache_set_expiry(
+                    f"articles_{source.value if source else "all"}_{page_number}",
+                    120,
+                    json.dumps([article.as_dict() for article in articles]),
+                )
 
         # Get unique sources
-        stmt = select(ArticleDB.source).distinct()
-        result = await db.execute(stmt)
-        unique_sources = result.scalars().all()
-        logger.debug(f"Unique sources in results: {unique_sources}")
+        if cached_unique_src:
+            unique_sources = cached_unique_src
+        else:
+            stmt = select(ArticleDB.source).distinct()
+            result = await db.execute(stmt)
+            unique_sources = result.scalars().all()
+            logger.debug(f"Unique sources in results: {unique_sources}")
+            redis_cache_set_expiry("unique_sources", 120, json.dumps(unique_sources))
 
-        stmt = select(func.count())
-        if source:
-            print(source)
-            stmt = stmt.where(ArticleDB.source == source)
+        if cached_total:
+            total_entries = cached_total
+        else:
+            stmt = select(func.count())
+            if source:
+                print(source)
+                stmt = stmt.where(ArticleDB.source == source)
 
-        if search_title:
-            print("Search needed for title: ", search_title)
-            stmt = stmt.filter(ArticleDB.title.icontains(search_title))
+            if search_title:
+                print("Search needed for title: ", search_title)
+                stmt = stmt.filter(ArticleDB.title.icontains(search_title))
 
-        if not search_title and not source:
-            stmt = stmt.select_from(articles_table)
+            if not search_title and not source:
+                stmt = stmt.select_from(articles_table)
 
-        result = await db.execute(stmt)
-        total_entries = result.scalar_one_or_none()
-        print("total entries:", total_entries)
+            result = await db.execute(stmt)
+            total_entries = result.scalar_one_or_none()
+            print("total entries:", total_entries)
 
-        # Get last update time
-        metadata_stmt = select(MetadataDB.update_at).where(
-            MetadataDB.key == "last_refresh"
-        )
-        metadata_result = await db.execute(metadata_stmt)
-        last_update = metadata_result.scalar_one_or_none()
-
-        logger.debug(f"Last update time: {last_update}")
+            if not search_title and page_number < 5:
+                redis_cache_set_expiry(
+                    f"total_{source.value if source else "all"}_{page_number}",
+                    120,
+                    total_entries,
+                )
 
         return {
             "articles": articles,

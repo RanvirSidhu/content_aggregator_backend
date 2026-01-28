@@ -18,6 +18,7 @@ from app.models.database import ArticleDB, MetadataDB
 from app.services.fetcher import fetch_all_sources
 from app.services.scheduler import start_scheduler, stop_scheduler
 from app.api.routes import router
+from app.db.cache import init_redis, shutdown_redis
 
 # Setup logging
 setup_logging()
@@ -91,6 +92,8 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Error during startup data check: {e}", exc_info=True)
 
+    # Initialize Cache
+    init_redis()
     # Start scheduler
     start_scheduler()
     logger.info("Application startup complete")
@@ -101,6 +104,7 @@ async def lifespan(app: FastAPI):
     # Shutdown
     logger.info("=" * 70)
     logger.info("Shutting down application...")
+    shutdown_redis()
     stop_scheduler()
     logger.info("Application shutdown complete")
     logger.info("=" * 70)
@@ -129,4 +133,3 @@ app.add_middleware(
 app.include_router(router)
 
 logger.info(f"FastAPI application configured: {settings.APP_NAME}")
-print("Settings:", settings)
