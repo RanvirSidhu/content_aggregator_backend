@@ -47,7 +47,7 @@ async def health_check():
 async def get_articles(
     source: Optional[SourceType] = None,
     limit: int = 10,
-    page_number: int = 0,
+    page_number: int = 1,
     search_title: str = "",
     db: AsyncSession = Depends(get_db),
 ):
